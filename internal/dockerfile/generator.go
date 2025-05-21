@@ -79,9 +79,15 @@ func (g *Generator) processHistory() []Instruction {
 			continue
 		}
 		
-		// Skip BuildKit metadata comments
-		if strings.Contains(entry.CreatedBy, "buildkit.dockerfile.v0") && strings.HasPrefix(entry.CreatedBy, "/bin/sh -c #(nop)") {
-			continue
+		// Skip pure BuildKit metadata comments (that have no useful content)
+		if strings.Contains(entry.CreatedBy, "buildkit.dockerfile.v0") && 
+		   strings.HasPrefix(entry.CreatedBy, "/bin/sh -c #(nop)") && 
+		   !strings.Contains(entry.CreatedBy, "COPY") && 
+		   !strings.Contains(entry.CreatedBy, "ADD") {
+			// Only skip if this is just a buildkit comment with no actual command
+			if len(strings.TrimSpace(strings.Replace(entry.CreatedBy, "buildkit.dockerfile.v0", "", -1))) < 5 {
+				continue
+			}
 		}
 		
 		// Determine timestamp for sorting
@@ -90,8 +96,13 @@ func (g *Generator) processHistory() []Instruction {
 		// Process the command
 		command, args := g.parseHistoryCommand(entry.CreatedBy)
 		
-		// Skip if the command contains buildkit metadata
-		if strings.Contains(args, "buildkit") {
+		// Clean up buildkit references from arguments
+		args = strings.Replace(args, "# buildkit", "", -1)
+		args = strings.Replace(args, "#buildkit", "", -1)
+		args = strings.TrimSpace(args)
+		
+		// Skip empty arguments after cleaning
+		if args == "" && command != "FROM" && command != "CMD" {
 			continue
 		}
 		
@@ -118,7 +129,7 @@ func (g *Generator) processHistory() []Instruction {
 			})
 		case "RUN":
 			// For RUN instructions, try to expand package manager commands to make them more readable
-			if i > 0 && !strings.Contains(args, "buildkit") {
+			if i > 0 {
 				expandedArgs := g.expandRun(args)
 				instructions = append(instructions, Instruction{
 					Command:    command,
@@ -127,13 +138,23 @@ func (g *Generator) processHistory() []Instruction {
 					EmptyLayer: entry.EmptyLayer,
 				})
 			}
+		case "COPY", "ADD":
+			// Special handling for COPY and ADD commands that might have buildkit references
+			instructions = append(instructions, Instruction{
+				Command:    command,
+				Arguments:  args,
+				Time:       timestamp,
+				EmptyLayer: entry.EmptyLayer,
+			})
 		default:
-			// For unknown or complex commands, add as a comment if it's not a basic /bin/sh -c
+			// For unknown or complex commands, add as a RUN command if it's not a basic /bin/sh -c
 			if !strings.HasPrefix(entry.CreatedBy, "/bin/sh -c #(nop)") && 
-			   command != "" && !entry.EmptyLayer && !strings.Contains(entry.CreatedBy, "buildkit") {
+			   command != "" && !entry.EmptyLayer {
+				cleanCmd := strings.Replace(entry.CreatedBy, "# buildkit", "", -1)
+				cleanCmd = strings.Replace(cleanCmd, "#buildkit", "", -1)
 				instructions = append(instructions, Instruction{
 					Command:    "RUN",
-					Arguments:  entry.CreatedBy,
+					Arguments:  cleanCmd,
 					Time:       timestamp,
 					EmptyLayer: entry.EmptyLayer,
 				})
@@ -141,7 +162,7 @@ func (g *Generator) processHistory() []Instruction {
 		}
 		
 		// Add any comment if present, except buildkit comments
-		if entry.Comment != "" && !strings.Contains(entry.Comment, "buildkit") {
+		if entry.Comment != "" && !strings.Contains(strings.ToLower(entry.Comment), "buildkit") {
 			instructions = append(instructions, Instruction{
 				Command:    "COMMENT",
 				Arguments:  entry.Comment,
@@ -170,12 +191,29 @@ func (g *Generator) processHistory() []Instruction {
 		}, instructions...)
 	}
 	
-	// Filter out any instructions with buildkit in the arguments
+	// Filter out standalone buildkit comments but preserve actual instructions
 	filteredInstructions := make([]Instruction, 0, len(instructions))
 	for _, inst := range instructions {
-		if !strings.Contains(strings.ToLower(inst.Arguments), "buildkit") {
-			filteredInstructions = append(filteredInstructions, inst)
+		// Skip instructions that are purely buildkit comments
+		if inst.Command == "COMMENT" && strings.Contains(strings.ToLower(inst.Arguments), "buildkit") {
+			continue
 		}
+		
+		// For other instructions, keep them but clean up any buildkit references
+		if strings.Contains(strings.ToLower(inst.Arguments), "buildkit") {
+			cleanArgs := strings.Replace(inst.Arguments, "# buildkit", "", -1)
+			cleanArgs = strings.Replace(cleanArgs, "#buildkit", "", -1)
+			cleanArgs = strings.TrimSpace(cleanArgs)
+			
+			// Skip if the instruction becomes empty after cleaning
+			if cleanArgs == "" && inst.Command != "FROM" && inst.Command != "CMD" {
+				continue
+			}
+			
+			inst.Arguments = cleanArgs
+		}
+		
+		filteredInstructions = append(filteredInstructions, inst)
 	}
 	
 	return filteredInstructions
