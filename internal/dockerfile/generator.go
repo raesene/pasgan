@@ -53,7 +53,10 @@ func (g *Generator) Generate(writer io.Writer) error {
 		} else {
 			// Handle multi-line RUN instructions
 			if instruction.Command == "RUN" && strings.Contains(instruction.Arguments, "\n") {
+				// Fix escaped backslashes in continuation lines
 				args := strings.ReplaceAll(instruction.Arguments, "\n", " \\\n    ")
+				// Remove double backslashes that might appear when a line already ends with a backslash
+				args = strings.ReplaceAll(args, "\\ \\\n", " \\\n")
 				fmt.Fprintf(writer, "%s %s\n", instruction.Command, args)
 			} else {
 				fmt.Fprintf(writer, "%s %s\n", instruction.Command, instruction.Arguments)
@@ -177,10 +180,30 @@ func (g *Generator) historyAscending() []docker.History {
 
 // parseHistoryCommand extracts the Dockerfile instruction and arguments from a history command
 func (g *Generator) parseHistoryCommand(cmd string) (string, string) {
+	// Trim any trailing whitespace
+	cmd = strings.TrimSpace(cmd)
+	
 	// Common prefixes in Docker history
 	if strings.HasPrefix(cmd, "/bin/sh -c #(nop) ") {
 		// This is a non-executing instruction (COPY, ENV, etc.)
 		remainder := strings.TrimPrefix(cmd, "/bin/sh -c #(nop) ")
+		remainder = strings.TrimSpace(remainder)
+		
+		// Extract the instruction
+		parts := strings.SplitN(remainder, " ", 2)
+		if len(parts) == 2 {
+			// Clean up quotes if needed
+			args := parts[1]
+			if strings.HasPrefix(args, "\"") && strings.HasSuffix(args, "\"") {
+				args = args[1 : len(args)-1]
+			}
+			return parts[0], args
+		}
+		return parts[0], ""
+	} else if strings.HasPrefix(cmd, "/bin/sh -c #(nop)") {
+		// Handle case where there's no space after #(nop)
+		remainder := strings.TrimPrefix(cmd, "/bin/sh -c #(nop)")
+		remainder = strings.TrimSpace(remainder)
 		
 		// Extract the instruction
 		parts := strings.SplitN(remainder, " ", 2)
@@ -191,10 +214,22 @@ func (g *Generator) parseHistoryCommand(cmd string) (string, string) {
 	} else if strings.HasPrefix(cmd, "/bin/sh -c ") {
 		// This is a RUN instruction
 		remainder := strings.TrimPrefix(cmd, "/bin/sh -c ")
+		
+		// Remove quotes if the entire command is quoted
+		if strings.HasPrefix(remainder, "\"") && strings.HasSuffix(remainder, "\"") {
+			remainder = remainder[1 : len(remainder)-1]
+		}
+		
 		return "RUN", remainder
 	} else if strings.HasPrefix(cmd, "bash -c ") {
 		// This is a RUN instruction with bash
 		remainder := strings.TrimPrefix(cmd, "bash -c ")
+		
+		// Remove quotes if the entire command is quoted
+		if strings.HasPrefix(remainder, "\"") && strings.HasSuffix(remainder, "\"") {
+			remainder = remainder[1 : len(remainder)-1]
+		}
+		
 		return "RUN", remainder
 	}
 	
@@ -209,7 +244,21 @@ func (g *Generator) parseHistoryCommand(cmd string) (string, string) {
 	for _, inst := range instructions {
 		if strings.HasPrefix(cmd, inst+" ") {
 			parts := strings.SplitN(cmd, " ", 2)
-			return parts[0], parts[1]
+			return parts[0], strings.TrimSpace(parts[1])
+		}
+	}
+	
+	// Special case for buildkit encoded commands
+	if strings.Contains(cmd, "buildkit.dockerfile.v0") {
+		// Try to extract the instruction
+		for _, inst := range instructions {
+			if strings.Contains(cmd, inst+" ") {
+				// Extract everything after the instruction
+				parts := strings.SplitN(cmd, inst+" ", 2)
+				if len(parts) == 2 {
+					return inst, strings.TrimSpace(parts[1])
+				}
+			}
 		}
 	}
 	
@@ -219,6 +268,12 @@ func (g *Generator) parseHistoryCommand(cmd string) (string, string) {
 
 // expandRun expands complex RUN commands to make them more readable
 func (g *Generator) expandRun(cmd string) string {
+	// First, clean up any existing escaped newlines to avoid conflicts
+	cmd = strings.ReplaceAll(cmd, "\\\n", " ")
+	
+	// Clean up excess whitespace
+	cmd = strings.TrimSpace(cmd)
+	
 	// Expand apt-get commands
 	aptRegex := regexp.MustCompile(`apt-get\s+\w+\s+(-\w+\s+)*([^&|;]+)`)
 	matches := aptRegex.FindAllStringSubmatchIndex(cmd, -1)
