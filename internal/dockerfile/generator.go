@@ -79,11 +79,21 @@ func (g *Generator) processHistory() []Instruction {
 			continue
 		}
 		
+		// Skip BuildKit metadata comments
+		if strings.Contains(entry.CreatedBy, "buildkit.dockerfile.v0") && strings.HasPrefix(entry.CreatedBy, "/bin/sh -c #(nop)") {
+			continue
+		}
+		
 		// Determine timestamp for sorting
 		timestamp, _ := time.Parse(time.RFC3339Nano, entry.Created)
 		
 		// Process the command
 		command, args := g.parseHistoryCommand(entry.CreatedBy)
+		
+		// Skip if the command contains buildkit metadata
+		if strings.Contains(args, "buildkit") {
+			continue
+		}
 		
 		// Handle special cases
 		switch command {
@@ -108,7 +118,7 @@ func (g *Generator) processHistory() []Instruction {
 			})
 		case "RUN":
 			// For RUN instructions, try to expand package manager commands to make them more readable
-			if i > 0 {
+			if i > 0 && !strings.Contains(args, "buildkit") {
 				expandedArgs := g.expandRun(args)
 				instructions = append(instructions, Instruction{
 					Command:    command,
@@ -120,7 +130,7 @@ func (g *Generator) processHistory() []Instruction {
 		default:
 			// For unknown or complex commands, add as a comment if it's not a basic /bin/sh -c
 			if !strings.HasPrefix(entry.CreatedBy, "/bin/sh -c #(nop)") && 
-			   command != "" && !entry.EmptyLayer {
+			   command != "" && !entry.EmptyLayer && !strings.Contains(entry.CreatedBy, "buildkit") {
 				instructions = append(instructions, Instruction{
 					Command:    "RUN",
 					Arguments:  entry.CreatedBy,
@@ -130,8 +140,8 @@ func (g *Generator) processHistory() []Instruction {
 			}
 		}
 		
-		// Add any comment if present
-		if entry.Comment != "" {
+		// Add any comment if present, except buildkit comments
+		if entry.Comment != "" && !strings.Contains(entry.Comment, "buildkit") {
 			instructions = append(instructions, Instruction{
 				Command:    "COMMENT",
 				Arguments:  entry.Comment,
@@ -160,7 +170,15 @@ func (g *Generator) processHistory() []Instruction {
 		}, instructions...)
 	}
 	
-	return instructions
+	// Filter out any instructions with buildkit in the arguments
+	filteredInstructions := make([]Instruction, 0, len(instructions))
+	for _, inst := range instructions {
+		if !strings.Contains(strings.ToLower(inst.Arguments), "buildkit") {
+			filteredInstructions = append(filteredInstructions, inst)
+		}
+	}
+	
+	return filteredInstructions
 }
 
 // historyAscending returns the history entries sorted by creation time (oldest first)
